@@ -25,6 +25,9 @@ def load_data(path: str) -> pd.DataFrame:
     # Identify metric columns (all numeric gate counters)
     non_metrics = {"Date", "Time", "start_time", "datetime", "hour"}
     metric_cols = [c for c in df.columns if c not in non_metrics]
+    # Exclude specified cameras from all visualizations
+    exclude_cols = {"Arch_Gate_Outside_IN_D36", "Arch_Gate_IN_OUT_D35"}
+    metric_cols = [c for c in metric_cols if c not in exclude_cols]
 
     # Coerce metrics to numeric
     for c in metric_cols:

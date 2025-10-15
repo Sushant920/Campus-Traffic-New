@@ -43,15 +43,54 @@ def melt_long(df: pd.DataFrame, metric_cols: list[str]) -> pd.DataFrame:
 
 
 def kpis(df: pd.DataFrame, metric_cols: list[str]):
-    total = int(df[metric_cols].sum().sum())
+    # Peak interval (unchanged: considers all gates)
     peak_row = df.loc[df[metric_cols].sum(axis=1).idxmax()]
     peak_dt = peak_row["datetime"]
     peak_val = int(peak_row[metric_cols].sum())
-    daily_totals = df.groupby(df["Date"].dt.date)[metric_cols].sum().sum(axis=1)
-    avg_daily = int(daily_totals.mean())
+
+    # Determine the two specific gates (Arch IN and Vallamai IN)
+    preferred_cols: list[str] = []
+    if "Arch_Gate_IN_D30" in metric_cols:
+        preferred_cols.append("Arch_Gate_IN_D30")
+    # Assume D13 represents Vallamai IN when available; fallback to D16
+    if "Vallamai_Main_Gate_D13" in metric_cols:
+        preferred_cols.append("Vallamai_Main_Gate_D13")
+    elif "Vallamai_Main_Gate_D16" in metric_cols:
+        preferred_cols.append("Vallamai_Main_Gate_D16")
+
+    # Fallback: try to infer sensible columns with pattern matching
+    selected_cols = preferred_cols if len(preferred_cols) == 2 else []
+    if not selected_cols:
+        arch_candidates = [
+            c for c in metric_cols
+            if "Arch" in c and "IN" in c and "IN_OUT" not in c and "Outside" not in c
+        ]
+        vall_candidates = [
+            c for c in metric_cols
+            if "Vallamai" in c and ("IN" in c or "Gate_D13" in c or "Gate_D16" in c)
+        ]
+        if arch_candidates:
+            selected_cols.append(arch_candidates[0])
+        if vall_candidates:
+            selected_cols.append(vall_candidates[0])
+
+    # If we still can't identify, fall back to all gates with a warning
+    if len(selected_cols) != 2:
+        st.warning(
+            "Could not identify Arch IN and Vallamai IN precisely; falling back to all gates for totals and average.",
+            icon="⚠️",
+        )
+        selected_cols = metric_cols
+
+    # Compute totals using ONLY the selected two gates when identified
+    total_selected = int(df[selected_cols].sum().sum())
+
+    # Compute Avg Daily for the selected gates
+    daily_subset = df.groupby(df["Date"].dt.date)[selected_cols].sum()
+    avg_daily = int(daily_subset.sum(axis=1).mean())
 
     c1, c2, c3 = st.columns(3)
-    c1.metric("Total Vehicles (all gates)", f"{total:,}")
+    c1.metric("Total Vehicles (Arch IN + Vallamai IN)", f"{total_selected:,}")
     c2.metric("Peak Interval", peak_dt.strftime("%Y-%m-%d %H:%M"), delta=f"{peak_val:,}")
     c3.metric("Avg Daily Volume", f"{avg_daily:,}")
 
@@ -126,6 +165,77 @@ def chart_time_series(df_long: pd.DataFrame, selected_metrics: list[str]):
     st.altair_chart(chart, use_container_width=True)
 
 
+def chart_daily_totals_with_average(df_long: pd.DataFrame, df_full: pd.DataFrame, metric_cols: list[str]):
+    """Bar chart of daily totals using ONLY Arch IN and Vallamai IN, plus average.
+
+    - Bars: computed from the current filtered dataset (df_long) but restricted
+      to the Arch IN and Vallamai IN gates only.
+    - Average line: computed across ALL available days from the full dataset
+      (df_full) for those same gates, regardless of current filters.
+    """
+
+    # Identify the exact gate metric names
+    arch_gate = "Arch_Gate_IN_D30" if "Arch_Gate_IN_D30" in metric_cols else None
+    vall_gate = None
+    if "Vallamai_Main_Gate_D13" in metric_cols:
+        vall_gate = "Vallamai_Main_Gate_D13"
+    elif "Vallamai_Main_Gate_D16" in metric_cols:
+        vall_gate = "Vallamai_Main_Gate_D16"
+
+    # Fallback detection if explicit names are missing
+    if arch_gate is None:
+        arch_candidates = [
+            c for c in metric_cols
+            if "Arch" in c and "IN" in c and "IN_OUT" not in c and "Outside" not in c
+        ]
+        arch_gate = arch_candidates[0] if arch_candidates else None
+    if vall_gate is None:
+        vall_candidates = [
+            c for c in metric_cols
+            if "Vallamai" in c and ("IN" in c or "Gate_D13" in c or "Gate_D16" in c)
+        ]
+        vall_gate = vall_candidates[0] if vall_candidates else None
+
+    selected_two = [g for g in [arch_gate, vall_gate] if g]
+    if not selected_two:
+        st.warning("Could not find Arch IN and Vallamai IN metrics.", icon="⚠️")
+        return
+
+    # Bars: use filtered long data restricted to those gates
+    subset = df_long[df_long["Gate"].isin(selected_two)]
+    daily = (
+        subset.groupby(subset["Date"].dt.date)["Count"].sum().reset_index()
+        .rename(columns={"Date": "Day", "Count": "Vehicles"})
+    )
+    # Use a string-formatted date for a discrete X axis with exactly one bar per day
+    daily["Day_str"] = pd.to_datetime(daily["Day"]).dt.strftime("%Y-%m-%d")
+
+    # Average line: compute using ALL days in the full dataset (wide form)
+    daily_full = df_full.groupby(df_full["Date"].dt.date)[selected_two].sum().sum(axis=1)
+    avg_all_days = float(daily_full.mean()) if len(daily_full) else 0.0
+
+    bars = (
+        alt.Chart(daily)
+        .mark_bar()
+        .encode(
+            x=alt.X("Day_str:N", title="Date"),
+            y=alt.Y("Vehicles:Q", title="Vehicles"),
+            tooltip=[alt.Tooltip("Day_str:N", title="Date"), "Vehicles:Q"],
+        )
+        .properties(height=260)
+    )
+
+    avg_rule = (
+        alt.Chart(pd.DataFrame({"avg": [avg_all_days]}))
+        .mark_rule(color="#d62728", strokeDash=[6, 4])
+        .encode(y="avg:Q")
+    )
+
+    st.subheader("Daily Vehicles (Bar) with Average")
+    st.altair_chart(bars + avg_rule, use_container_width=True)
+    st.caption(f"Daily average (Arch IN + Vallamai IN): {int(round(avg_all_days)):,}")
+
+
 def chart_bar_totals(df_long: pd.DataFrame):
     totals = df_long.groupby("Gate")["Count"].sum().reset_index()
     chart = (
@@ -139,20 +249,22 @@ def chart_bar_totals(df_long: pd.DataFrame):
         )
         .properties(height=280)
     )
-    st.subheader("Totals by Gate")
+    st.subheader("Totals by Camera")
     st.altair_chart(chart, use_container_width=True)
 
 
 def chart_stacked_by_day(df_long: pd.DataFrame):
     daily = df_long.groupby([df_long["Date"].dt.date, "Gate"])['Count'].sum().reset_index().rename(columns={"Date": "Day"})
+    # Use ISO date string for a discrete axis (exactly one bar per day, no time)
+    daily["Day_str"] = pd.to_datetime(daily["Day"]).dt.strftime("%Y-%m-%d")
     chart = (
         alt.Chart(daily)
         .mark_bar()
         .encode(
-            x=alt.X("Day:T", title="Day"),
+            x=alt.X("Day_str:N", title="Date"),
             y=alt.Y("Count:Q", stack=True, title="Vehicles"),
             color=alt.Color("Gate:N", title="Gate"),
-            tooltip=["Day:T", "Gate:N", "Count:Q"],
+            tooltip=[alt.Tooltip("Day_str:N", title="Date"), "Gate:N", "Count:Q"],
         )
         .properties(height=280)
     )
@@ -249,6 +361,7 @@ def main():
 
     # Charts
     chart_time_series(df_long, filters["selected_metrics"])
+    chart_daily_totals_with_average(df_long, df, metric_cols)
     c1, c2 = st.columns(2)
     with c1:
         chart_bar_totals(df_long)
